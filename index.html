@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Wedding Guest Check-in</title>
+
+  <script src="https://unpkg.com/html5-qrcode"></script>
+
+  <style>
+    body {
+      margin: 0;
+      padding: 20px;
+      background: #f7f4f2;
+      color: #333;
+      font-family: Arial, sans-serif;
+    }
+
+    main {
+      max-width: 480px;
+      margin: auto;
+      padding: 22px;
+      background: white;
+      border-radius: 16px;
+      box-shadow: 0 3px 12px #0002;
+    }
+
+    h1 {
+      color: #702632;
+      text-align: center;
+      font-size: 25px;
+    }
+
+    p {
+      line-height: 1.5;
+    }
+
+    input, button {
+      box-sizing: border-box;
+      width: 100%;
+      padding: 14px;
+      margin: 8px 0;
+      border-radius: 8px;
+      font-size: 16px;
+    }
+
+    input {
+      border: 1px solid #bbb;
+    }
+
+    button {
+      border: 0;
+      color: white;
+      background: #702632;
+      font-weight: bold;
+      cursor: pointer;
+    }
+
+    button:disabled {
+      opacity: 0.6;
+    }
+
+    #reader {
+      margin-top: 18px;
+      width: 100%;
+    }
+
+    #result {
+      padding: 18px;
+      margin-top: 18px;
+      border-radius: 10px;
+      font-weight: bold;
+      text-align: center;
+      overflow-wrap: anywhere;
+    }
+
+    .waiting { background: #eee9e6; }
+    .good { background: #d9f5df; color: #145c28; }
+    .bad { background: #ffe0e0; color: #8b1111; }
+  </style>
+</head>
+
+<body>
+<main>
+  <h1>Wedding Guest Check-in</h1>
+  <p>Authorized admission staff only. Enter your staff PIN to begin.</p>
+
+  <form id="pinForm">
+    <input
+      id="pin"
+      type="password"
+      autocomplete="current-password"
+      placeholder="Staff PIN"
+      required
+    >
+    <button type="submit">Unlock Scanner</button>
+  </form>
+
+  <button id="startButton" hidden>Start Camera Scanner</button>
+  <button id="stopButton" hidden>Stop Scanner</button>
+
+  <div id="reader"></div>
+
+  <div id="result" class="waiting" role="status" aria-live="polite">
+    Enter your staff PIN to begin.
+  </div>
+  <p id="guestDetails"></p>
+</main>
+
+<script>
+  const WORKER_URL =
+    "https://wedding-checkin-bridge.ckwagbz.workers.dev";
+
+  let staffPin = "";
+  let scanner = null;
+  let busy = false;
+  let lastCode = "";
+  let lastTime = 0;
+
+  const resultBox = document.getElementById("result");
+  const detailsBox = document.getElementById("guestDetails");
+  const startButton = document.getElementById("startButton");
+  const stopButton = document.getElementById("stopButton");
+
+  function showResult(message, type = "waiting", details = "") {
+    resultBox.textContent = message;
+    resultBox.className = type;
+    detailsBox.textContent = details;
+  }
+
+  async function sendRequest(data) {
+    const response = await fetch(WORKER_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data)
+    });
+
+    const result = await response.json();
+
+    if (!response.ok && result.status !== "UNAUTHORIZED") {
+      throw new Error(result.message || "Request failed.");
+    }
+
+    return result;
+  }
+
+  document.getElementById("pinForm").addEventListener("submit", async event => {
+    event.preventDefault();
+
+    staffPin = document.getElementById("pin").value.trim();
+
+    if (!staffPin) {
+      showResult("Enter your staff PIN.", "bad");
+      return;
+    }
+
+    showResult("Checking staff access...");
+
+    try {
+      const result = await sendRequest({
+        action: "health",
+        pin: staffPin
+      });
+
+      if (result.status !== "OK") {
+        staffPin = "";
+        showResult(
+          result.message || "Access denied.",
+          "bad"
+        );
+        return;
+      }
+
+      document.getElementById("pinForm").hidden = true;
+      startButton.hidden = false;
+      showResult("Access granted. Start the camera when ready.", "good");
+
+    } catch (error) {
+      staffPin = "";
+      showResult(
+        "Could not verify access. Check your connection and try again.",
+        "bad"
+      );
+    }
+  });
+
+  startButton.addEventListener("click", async () => {
+    if (scanner) return;
+
+    if (typeof Html5Qrcode === "undefined") {
+      showResult("Scanner library failed to load. Check internet access.", "bad");
+      return;
+    }
+
+    scanner = new Html5Qrcode("reader");
+
+    try {
+      await scanner.start(
+        { facingMode: "environment" },
+        { fps: 10, qrbox: { width: 230, height: 230 } },
+        onScanSuccess,
+        () => {}
+      );
+
+      startButton.hidden = true;
+      stopButton.hidden = false;
+      showResult("Camera ready. Scan a guest's QR code.");
+
+    } catch (error) {
+      scanner = null;
+      showResult(
+        "Camera could not start. Allow camera access in your browser settings.",
+        "bad"
+      );
+    }
+  });
+
+  stopButton.addEventListener("click", stopScanner);
+
+  async function stopScanner() {
+    if (scanner) {
+      try {
+        await scanner.stop();
+        await scanner.clear();
+      } catch (error) {
+        console.error(error);
+      }
+      scanner = null;
+    }
+
+    startButton.hidden = false;
+    stopButton.hidden = true;
+    busy = false;
+    showResult("Scanner stopped.");
+  }
+
+  async function onScanSuccess(decodedText) {
+    const now = Date.now();
+
+    if (busy) return;
+    if (decodedText === lastCode && now - lastTime < 4000) return;
+
+    busy = true;
+    lastCode = decodedText;
+    lastTime = now;
+
+    showResult("Checking guest with Airtable...");
+
+    try {
+      const result = await sendRequest({
+        pin: staffPin,
+        qrValue: decodedText
+      });
+
+      if (result.status === "ADMITTED") {
+        showResult(
+          "VALID — ADMIT",
+          "good",
+          (result.guestName || "Guest") + " · " + (result.guestType || "Guest")
+        );
+      } else if (result.status === "ALREADY_CHECKED_IN") {
+        showResult("ALREADY CHECKED IN — DO NOT ADMIT AGAIN", "bad");
+      } else {
+        showResult(result.message || "DO NOT ADMIT", "bad");
+      }
+
+    } catch (error) {
+      showResult(
+        "CHECK-IN FAILED — DO NOT ADMIT YET",
+        "bad",
+        "Ask the supervisor to check the system."
+      );
+    } finally {
+      busy = false;
+    }
+  }
+</script>
+</body>
+</html>
